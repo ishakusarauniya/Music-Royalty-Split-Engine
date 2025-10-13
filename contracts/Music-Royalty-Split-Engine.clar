@@ -5,6 +5,10 @@
 (define-constant ERR_ALREADY_EXISTS (err u104))
 (define-constant ERR_INVALID_CONTRIBUTOR (err u105))
 
+(define-constant ERR_NOT_VESTED (err u106))
+(define-constant ERR_ALREADY_CLAIMED (err u107))
+(define-constant ERR_INVALID_VESTING (err u108))
+
 (define-data-var contract-owner principal tx-sender)
 
 (define-map songs 
@@ -184,5 +188,104 @@
     contributor-data 
       (ok (/ (* amount (get split-percentage contributor-data)) u10000))
     ERR_INVALID_CONTRIBUTOR
+  )
+)
+
+
+(define-map vesting-schedules
+  { song-id: uint, distribution-id: uint, contributor: principal }
+  {
+    total-amount: uint,
+    start-block: uint,
+    cliff-blocks: uint,
+    vesting-blocks: uint,
+    claimed-amount: uint
+  }
+)
+
+(define-read-only (get-vesting-details (song-id uint) (distribution-id uint) (contributor principal))
+  (map-get? vesting-schedules { song-id: song-id, distribution-id: distribution-id, contributor: contributor })
+)
+
+(define-read-only (get-vested-amount (song-id uint) (distribution-id uint) (contributor principal))
+  (match (get-vesting-details song-id distribution-id contributor)
+    schedule
+      (let
+        (
+          (current-block burn-block-height)
+          (start-block (get start-block schedule))
+          (cliff-blocks (get cliff-blocks schedule))
+          (vesting-blocks (get vesting-blocks schedule))
+          (total-amount (get total-amount schedule))
+          (claimed-amount (get claimed-amount schedule))
+          (cliff-end (+ start-block cliff-blocks))
+          (vesting-end (+ cliff-end vesting-blocks))
+        )
+        (if (< current-block cliff-end)
+          (ok u0)
+          (if (>= current-block vesting-end)
+            (ok (- total-amount claimed-amount))
+            (let
+              (
+                (blocks-since-cliff (- current-block cliff-end))
+                (vested-amount (/ (* total-amount blocks-since-cliff) vesting-blocks))
+                (claimable (- vested-amount claimed-amount))
+              )
+              (ok claimable)
+            )
+          )
+        )
+      )
+    (ok u0)
+  )
+)
+
+(define-public (create-vesting-schedule 
+  (song-id uint)
+  (distribution-id uint)
+  (contributor principal)
+  (amount uint)
+  (cliff-blocks uint)
+  (vesting-blocks uint)
+)
+  (let
+    (
+      (start-block burn-block-height)
+    )
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_VESTING)
+    (asserts! (> vesting-blocks u0) ERR_INVALID_VESTING)
+    
+    (map-set vesting-schedules
+      { song-id: song-id, distribution-id: distribution-id, contributor: contributor }
+      {
+        total-amount: amount,
+        start-block: start-block,
+        cliff-blocks: cliff-blocks,
+        vesting-blocks: vesting-blocks,
+        claimed-amount: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-vested-royalty (song-id uint) (distribution-id uint))
+  (let
+    (
+      (schedule (unwrap! (get-vesting-details song-id distribution-id tx-sender) ERR_SONG_NOT_FOUND))
+      (claimable-amount (unwrap! (get-vested-amount song-id distribution-id tx-sender) ERR_NOT_VESTED))
+      (distribution-data (unwrap! (get-distribution-history song-id distribution-id) ERR_SONG_NOT_FOUND))
+    )
+    (asserts! (> claimable-amount u0) ERR_NOT_VESTED)
+    
+    (try! (stx-transfer? claimable-amount (get distributor distribution-data) tx-sender))
+    
+    (map-set vesting-schedules
+      { song-id: song-id, distribution-id: distribution-id, contributor: tx-sender }
+      (merge schedule { claimed-amount: (+ (get claimed-amount schedule) claimable-amount) })
+    )
+    
+    (ok claimable-amount)
   )
 )
