@@ -9,6 +9,15 @@
 (define-constant ERR_ALREADY_CLAIMED (err u107))
 (define-constant ERR_INVALID_VESTING (err u108))
 
+(define-constant ERR_NOT_SIGNER (err u109))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u110))
+(define-constant ERR_ALREADY_APPROVED (err u111))
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u112))
+(define-constant ERR_PROPOSAL_EXECUTED (err u113))
+
+(define-data-var required-approvals uint u2)
+(define-data-var proposal-counter uint u0)
+
 (define-data-var contract-owner principal tx-sender)
 
 (define-map songs 
@@ -287,5 +296,103 @@
     )
     
     (ok claimable-amount)
+  )
+)
+
+
+(define-map authorized-signers principal bool)
+
+(define-map song-proposals
+  { proposal-id: uint }
+  {
+    title: (string-ascii 128),
+    artist: (string-ascii 64),
+    contributors-list: (list 20 { contributor: principal, split: uint }),
+    proposer: principal,
+    approval-count: uint,
+    executed: bool,
+    created-at: uint
+  }
+)
+
+(define-map proposal-approvals
+  { proposal-id: uint, signer: principal }
+  bool
+)
+
+(define-read-only (is-authorized-signer (signer principal))
+  (default-to false (map-get? authorized-signers signer))
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? song-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (has-approved (proposal-id uint) (signer principal))
+  (default-to false (map-get? proposal-approvals { proposal-id: proposal-id, signer: signer }))
+)
+
+(define-public (add-signer (new-signer principal))
+  (begin
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (map-set authorized-signers new-signer true)
+    (ok true)
+  )
+)
+
+(define-public (propose-song-registration
+  (title (string-ascii 128))
+  (artist (string-ascii 64))
+  (contributors-list (list 20 { contributor: principal, split: uint }))
+)
+  (let ((proposal-id (+ (var-get proposal-counter) u1)))
+    (asserts! (is-authorized-signer tx-sender) ERR_NOT_SIGNER)
+    (asserts! (validate-splits contributors-list) ERR_INVALID_SPLIT)
+    
+    (map-set song-proposals
+      { proposal-id: proposal-id }
+      {
+        title: title,
+        artist: artist,
+        contributors-list: contributors-list,
+        proposer: tx-sender,
+        approval-count: u0,
+        executed: false,
+        created-at: burn-block-height
+      }
+    )
+    (var-set proposal-counter proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (approve-proposal (proposal-id uint))
+  (let ((proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND)))
+    (asserts! (is-authorized-signer tx-sender) ERR_NOT_SIGNER)
+    (asserts! (not (has-approved proposal-id tx-sender)) ERR_ALREADY_APPROVED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_EXECUTED)
+    
+    (map-set proposal-approvals { proposal-id: proposal-id, signer: tx-sender } true)
+    (map-set song-proposals
+      { proposal-id: proposal-id }
+      (merge proposal { approval-count: (+ (get approval-count proposal) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  (let ((proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND)))
+    (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+    (asserts! (>= (get approval-count proposal) (var-get required-approvals)) ERR_INSUFFICIENT_APPROVALS)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_EXECUTED)
+    
+    (try! (register-song (get title proposal) (get artist proposal) (get contributors-list proposal)))
+    
+    (map-set song-proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    (ok true)
   )
 )
